@@ -47,22 +47,22 @@ static bool pdo_remap(uint16 slave) {
   bool ok = true;
 
   // SM2 (Outputs / RxPDO) -> 1C12, map at 1600
-  ok &= sdo_u8 (slave, idx::SM2_PDO_ASSIGN, 0x00, 0);
-  ok &= sdo_u8 (slave, idx::RX_PDO_MAP1,   0x00, 0);
-  ok &= sdo_u32(slave, idx::RX_PDO_MAP1,   0x01, mapval::RX_6040_16);
-  ok &= sdo_u32(slave, idx::RX_PDO_MAP1,   0x02, mapval::RX_607A_32);
-  ok &= sdo_u8 (slave, idx::RX_PDO_MAP1,   0x00, DefaultPdoMap6B::rx_entries);
-  ok &= sdo_u16(slave, idx::SM2_PDO_ASSIGN,0x01, idx::RX_PDO_MAP1);
-  ok &= sdo_u8 (slave, idx::SM2_PDO_ASSIGN,0x00, 1);
+  ok &= sdo_u8 (slave, idx::SM2_PDO_ASSIGN, 0x00, 0);   // Clear existing mapping
+  ok &= sdo_u8 (slave, idx::RX_PDO_MAP1,   0x00, 0);    // Clear existing map
+  ok &= sdo_u32(slave, idx::RX_PDO_MAP1,   0x01, mapval::RX_6040_16);   // CONTROLWOR
+  ok &= sdo_u32(slave, idx::RX_PDO_MAP1,   0x02, mapval::RX_607A_32);   // TARGET_POSITION
+  ok &= sdo_u8 (slave, idx::RX_PDO_MAP1,   0x00, DefaultPdoMap6B::rx_entries);  // RxPDO entries
+  ok &= sdo_u16(slave, idx::SM2_PDO_ASSIGN,0x01, idx::RX_PDO_MAP1);     // Assign RxPDO map
+  ok &= sdo_u8 (slave, idx::SM2_PDO_ASSIGN,0x00, 1);    // SM2 entry count
 
   // SM3 (Inputs / TxPDO) -> 1C13, map at 1A00
-  ok &= sdo_u8 (slave, idx::SM3_PDO_ASSIGN, 0x00, 0);
-  ok &= sdo_u8 (slave, idx::TX_PDO_MAP1,    0x00, 0);
-  ok &= sdo_u32(slave, idx::TX_PDO_MAP1,    0x01, mapval::TX_6041_16);
-  ok &= sdo_u32(slave, idx::TX_PDO_MAP1,    0x02, mapval::TX_6064_32);
-  ok &= sdo_u8 (slave, idx::TX_PDO_MAP1,    0x00, DefaultPdoMap6B::tx_entries);
-  ok &= sdo_u16(slave, idx::SM3_PDO_ASSIGN, 0x01, idx::TX_PDO_MAP1);
-  ok &= sdo_u8 (slave, idx::SM3_PDO_ASSIGN, 0x00, 1);
+  ok &= sdo_u8 (slave, idx::SM3_PDO_ASSIGN, 0x00, 0);   // Clear existing mapping
+  ok &= sdo_u8 (slave, idx::TX_PDO_MAP1,    0x00, 0);   // Clear existing map
+  ok &= sdo_u32(slave, idx::TX_PDO_MAP1,    0x01, mapval::TX_6041_16);  // STATUSWORD
+  ok &= sdo_u32(slave, idx::TX_PDO_MAP1,    0x02, mapval::TX_6064_32);  // POSITION_ACTUAL
+  ok &= sdo_u8 (slave, idx::TX_PDO_MAP1,    0x00, DefaultPdoMap6B::tx_entries); // TxPDO entries
+  ok &= sdo_u16(slave, idx::SM3_PDO_ASSIGN, 0x01, idx::TX_PDO_MAP1);    // Assign TxPDO map
+  ok &= sdo_u8 (slave, idx::SM3_PDO_ASSIGN, 0x00, 1);   // SM3 entry count
 
   return ok;
 }
