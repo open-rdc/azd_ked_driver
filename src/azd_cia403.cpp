@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <cstdlib>
 #include <soem/ethercat.h>
 
 #include "azd_ked_driver/azd_cia402.hpp"
