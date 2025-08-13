@@ -1,0 +1,9 @@
+<launch>
+  <rosparam file="$(find azd_ked_driver)/config/azd_ked_multi.yaml" command="load" ns="azd_ked_multi" />
+
+  <arg name="ifname" default=""/>
+
+  <node pkg="azd_ked_driver" type="azd_ked_multi_node" name="azd_ked_multi" output="screen">
+    <param name="ifname" value="$(arg ifname)" if="$(arg ifname)"/>
+  </node>
+</launch>

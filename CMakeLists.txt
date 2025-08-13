@@ -84,6 +84,18 @@ target_link_libraries(azd_ked_node
   Threads::Threads
 )
 
+## 3) Multi-motor ROS node
+add_executable(azd_ked_multi_node
+  src/azd_ked_multi_node.cpp
+)
+target_include_directories(azd_ked_multi_node PRIVATE ${_COMMON_INCLUDES})
+target_compile_options(azd_ked_multi_node PRIVATE -O2)
+target_link_libraries(azd_ked_multi_node
+  ${catkin_LIBRARIES}
+  ${SOEM_LIB}
+  Threads::Threads
+)
+
 # ===== Post-build capabilities (automatic setcap) =====
 # After you add a sudoers rule (NOPASSWD for setcap on this binary),
 # this will run without prompting and keep capabilities across rebuilds.
@@ -99,12 +111,18 @@ if(SETCAP_EXEC)
     COMMAND sudo -n ${SETCAP_EXEC} cap_net_raw,cap_net_admin+eip $<TARGET_FILE:azd_ked_node> || true
     VERBATIM
   )
+  add_custom_command(TARGET azd_ked_multi_node POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "→ setcap on $<TARGET_FILE:azd_ked_multi_node>"
+    COMMAND sudo -n ${SETCAP_EXEC} cap_net_raw,cap_net_admin+eip $<TARGET_FILE:azd_ked_multi_node> || true
+    VERBATIM
+  )
 endif()
 
 # ===== Install =====
 install(TARGETS
   azd_ked_pp_check
   azd_ked_node
+  azd_ked_multi_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
