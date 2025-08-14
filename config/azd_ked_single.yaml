@@ -1,0 +1,11 @@
+ifname: "enp0s31f6"
+cycle_hz: 500
+
+motors:
+  names: [joint1]
+
+  joint1:
+    slave: 1
+    profile_velocity: 20000
+    profile_acc: 20000
+    profile_dec: 20000
