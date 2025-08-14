@@ -136,3 +136,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
     DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
   )
 endif()
+
+add_custom_command(TARGET azd_ked_pp_check POST_BUILD
+  COMMAND sudo setcap cap_net_raw,cap_net_admin=eip $<TARGET_FILE:azd_ked_pp_check>
+)
