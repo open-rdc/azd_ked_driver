@@ -3,7 +3,9 @@
 
   <arg name="ifname" default=""/>
 
-  <node pkg="azd_ked_driver" type="azd_ked_multi_node" name="azd_ked_multi" output="screen">
-    <param name="ifname" value="$(arg ifname)" if="$(arg ifname)"/>
-  </node>
+  <group if="$(eval arg('ifname') != '')" ns="azd_ked_multi">
+    <param name="ifname" value="$(arg ifname)"/>
+  </group>
+
+  <node pkg="azd_ked_driver" type="azd_ked_multi_node" name="azd_ked_multi" output="screen"/>
 </launch>
