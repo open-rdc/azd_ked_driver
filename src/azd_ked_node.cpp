@@ -67,22 +67,79 @@ static bool pdo_remap(uint16 slave) {
   return ok;
 }
 
-// ===== CiA-402 state transition: Shutdown -> SwitchOn -> EnableOperation =====
-static void cia402_enable(uint16 /*slave*/, azd::cia402::RxPdoPP6B* rx) {
+// === CiA-402 state check helpers (using sw constants from header) ===
+inline bool is_fault(uint16_t swv) { return (swv & azd::cia402::sw::FAULT) != 0; }
+
+// CiA-402 generic state mask (matches 0x006F in the spec)
+static constexpr uint16_t kStateMask = 0x006F;
+// Expected values for common states
+static constexpr uint16_t kRTSO = azd::cia402::sw::READY_TO_SWITCH_ON | azd::cia402::sw::QUICK_STOP_ACTIVE;                 // 0x0021
+static constexpr uint16_t kSON  = azd::cia402::sw::READY_TO_SWITCH_ON | azd::cia402::sw::SWITCHED_ON | azd::cia402::sw::QUICK_STOP_ACTIVE; // 0x0023
+static constexpr uint16_t kOPE  = azd::cia402::sw::READY_TO_SWITCH_ON | azd::cia402::sw::SWITCHED_ON | azd::cia402::sw::OPERATION_ENABLED | azd::cia402::sw::QUICK_STOP_ACTIVE; // 0x0027
+
+inline bool is_ready_to_switch_on(uint16_t swv) { return (swv & kStateMask) == kRTSO; }
+inline bool is_switched_on       (uint16_t swv) { return (swv & kStateMask) == kSON;  }
+inline bool is_operation_enabled (uint16_t swv) { return (swv & kStateMask) == kOPE;  }
+
+// === Wait utility (terminates early if a Fault is detected) ===
+static bool wait_state(std::function<void()> io, std::function<uint16_t()> get_sw,
+                       std::function<bool(uint16_t)> pred,
+                       double timeout_s, double cycle_s)
+{
+  const int max_iter = std::max(1, int(timeout_s / cycle_s));
+  for (int i = 0; i < max_iter; ++i) {
+    io();
+    const auto swv = get_sw();
+    if (is_fault(swv)) return false;      // Abort if a Fault is detected
+    if (pred(swv))     return true;       // Target state reached
+    ros::Duration(cycle_s).sleep();
+  }
+  return false;                           // Timed out waiting
+}
+
+// === Enable procedure (using cw constants from header, with Fault reset) ===
+static bool cia402_enable(uint16 /*slave*/,
+                          azd::cia402::RxPdoPP6B* rx,
+                          const azd::cia402::TxPdoPP6B* tx,
+                          double cycle_s = 0.002 /*2ms*/,
+                          double timeout_s = 1.0  /*1s per stage*/)
+{
   using namespace azd::cia402;
-  auto sendrecv = [](){
-    ec_send_processdata();
-    ec_receive_processdata(EC_TIMEOUTRET);
-  };
+  auto io     = [](){ ec_send_processdata(); ec_receive_processdata(EC_TIMEOUTRET); };
+  auto get_sw = [tx](){ return tx->statusword; };
 
-  rx->controlword = cw::SHUTDOWN;
-  for (int i = 0; i < 10; ++i) { sendrecv(); ros::Duration(0.02).sleep(); }
+  // --- If Fault is present, send Fault Reset ---
+  if (is_fault(get_sw())) {
+    static constexpr uint16_t FAULT_RESET = (1u << 7); // Controlword bit7 = Fault Reset
+    rx->controlword = FAULT_RESET;
+    if (!wait_state(io, get_sw, [](uint16_t swv){ return !is_fault(swv); }, timeout_s, cycle_s)) {
+      ROS_ERROR("Fault reset timeout");
+      return false;
+    }
+  }
 
-  rx->controlword = cw::SWITCH_ON_ONLY;
-  for (int i = 0; i < 10; ++i) { sendrecv(); ros::Duration(0.02).sleep(); }
+  // 1) Shutdown → Ready to Switch On
+  rx->controlword = cw::SHUTDOWN;              // ENABLE_VOLTAGE | QUICK_STOP
+  if (!wait_state(io, get_sw, is_ready_to_switch_on, timeout_s, cycle_s)) {
+    ROS_ERROR("Timeout waiting Ready-to-Switch-On");
+    return false;
+  }
 
-  rx->controlword = cw::ENABLE_OP;
-  for (int i = 0; i < 10; ++i) { sendrecv(); ros::Duration(0.02).sleep(); }
+  // 2) Switch On → Switched On
+  rx->controlword = cw::SWITCH_ON_ONLY;        // + SWITCH_ON
+  if (!wait_state(io, get_sw, is_switched_on, timeout_s, cycle_s)) {
+    ROS_ERROR("Timeout waiting Switched-On");
+    return false;
+  }
+
+  // 3) Enable Operation → Operation Enabled
+  rx->controlword = cw::ENABLE_OP;             // + ENABLE_OPERATION
+  if (!wait_state(io, get_sw, is_operation_enabled, timeout_s, cycle_s)) {
+    ROS_ERROR("Timeout waiting Operation-Enabled");
+    return false;
+  }
+
+  return true;
 }
 
 // ===== Trigger new set-point in PP mode =====
@@ -184,7 +241,7 @@ int main(int argc, char** argv)
   rx->target_position = 0;
 
   // Enable CiA-402
-  cia402_enable(slave, rx);
+   cia402_enable(slave, rx, tx);
 
   // Publishers
   ros::Publisher pub_sw  = pnh.advertise<std_msgs::UInt16>("status_word", 10);
