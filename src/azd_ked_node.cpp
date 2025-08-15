@@ -134,7 +134,7 @@ static void trigger_pp(azd::cia402::RxPdoPP6B* rx, int32_t tgt,
   }
 
   // パルスOFF（ベースへ復帰：Bit4/5を確実に落とす）
-  // rx->controlword = base;
+  rx->controlword = base;
   for (int i = 0; i < 5; ++i) {
     ec_send_processdata(); ec_receive_processdata(EC_TIMEOUTRET);
     ros::Duration(0.002).sleep();
