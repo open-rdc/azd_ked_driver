@@ -1,5 +1,5 @@
 // src/azd_ked_node.cpp
-// AZD-KED minimal PP control as a ROS1 node using SOEM.
+// AZD-KED minimal PP control as a ROS1 node using SOEM, with robust startup.
 // - Uses azd_cia402.hpp for readable object indices, masks, and PDO types.
 // - Publishes:  ~status_word (std_msgs/UInt16), ~position_actual (std_msgs/Int32)
 // - Subscribes: ~target_position (absolute), ~move_delta (relative)
@@ -9,16 +9,18 @@
 #include <std_msgs/Int32.h>
 #include <std_msgs/UInt16.h>
 #include <atomic>
-#include <algorithm>   // std::max
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <iostream>
 
 // SOEM (C headers)
 extern "C" {
 #include <ethercat.h>
 }
 
-// AZD-KED CiA-402 constants/types
+// AZD-KED CiA-402 constants/types（ユーザ環境のヘッダを使用）
 #include "azd_ked_driver/azd_cia402.hpp"
 
 #define SLAVE_DEFAULT 1
@@ -49,116 +51,103 @@ static bool pdo_remap(uint16 slave) {
   // SM2 (Outputs / RxPDO) -> 1C12, map at 1600
   ok &= sdo_u8 (slave, idx::SM2_PDO_ASSIGN, 0x00, 0);   // Clear existing mapping
   ok &= sdo_u8 (slave, idx::RX_PDO_MAP1,   0x00, 0);    // Clear existing map
-  ok &= sdo_u32(slave, idx::RX_PDO_MAP1,   0x01, mapval::RX_6040_16);   // CONTROLWOR
+  ok &= sdo_u32(slave, idx::RX_PDO_MAP1,   0x01, mapval::RX_6040_16);   // CONTROLWORD
   ok &= sdo_u32(slave, idx::RX_PDO_MAP1,   0x02, mapval::RX_607A_32);   // TARGET_POSITION
-  ok &= sdo_u8 (slave, idx::RX_PDO_MAP1,   0x00, DefaultPdoMap6B::rx_entries);  // RxPDO entries
-  ok &= sdo_u16(slave, idx::SM2_PDO_ASSIGN,0x01, idx::RX_PDO_MAP1);     // Assign RxPDO map
-  ok &= sdo_u8 (slave, idx::SM2_PDO_ASSIGN,0x00, 1);    // SM2 entry count
+  ok &= sdo_u8 (slave, idx::RX_PDO_MAP1,   0x00, azd::cia402::DefaultPdoMap6B::rx_entries);
+  ok &= sdo_u16(slave, idx::SM2_PDO_ASSIGN,0x01, idx::RX_PDO_MAP1);
+  ok &= sdo_u8 (slave, idx::SM2_PDO_ASSIGN,0x00, 1);
 
   // SM3 (Inputs / TxPDO) -> 1C13, map at 1A00
   ok &= sdo_u8 (slave, idx::SM3_PDO_ASSIGN, 0x00, 0);   // Clear existing mapping
   ok &= sdo_u8 (slave, idx::TX_PDO_MAP1,    0x00, 0);   // Clear existing map
   ok &= sdo_u32(slave, idx::TX_PDO_MAP1,    0x01, mapval::TX_6041_16);  // STATUSWORD
   ok &= sdo_u32(slave, idx::TX_PDO_MAP1,    0x02, mapval::TX_6064_32);  // POSITION_ACTUAL
-  ok &= sdo_u8 (slave, idx::TX_PDO_MAP1,    0x00, DefaultPdoMap6B::tx_entries); // TxPDO entries
-  ok &= sdo_u16(slave, idx::SM3_PDO_ASSIGN, 0x01, idx::TX_PDO_MAP1);    // Assign TxPDO map
-  ok &= sdo_u8 (slave, idx::SM3_PDO_ASSIGN, 0x00, 1);   // SM3 entry count
+  ok &= sdo_u8 (slave, idx::TX_PDO_MAP1,    0x00, azd::cia402::DefaultPdoMap6B::tx_entries);
+  ok &= sdo_u16(slave, idx::SM3_PDO_ASSIGN, 0x01, idx::TX_PDO_MAP1);
+  ok &= sdo_u8 (slave, idx::SM3_PDO_ASSIGN, 0x00, 1);
 
+  // 動作モード PP (=1) とプロファイル（後で上書き可）
+  ok &= sdo_u8 (slave, idx::MODES_OF_OPERATION, 0x00, static_cast<int8_t>(azd::cia402::OpMode::PP));
+
+  if (!ok) {
+    ROS_WARN("[pdo_remap] FAILED AL=0x%04X", ec_slave[slave].ALstatuscode);
+  } else {
+    ROS_INFO("[pdo_remap] success");
+  }
   return ok;
 }
 
-// === CiA-402 state check helpers (using sw constants from header) ===
-inline bool is_fault(uint16_t swv) { return (swv & azd::cia402::sw::FAULT) != 0; }
-
-// CiA-402 generic state mask (matches 0x006F in the spec)
-static constexpr uint16_t kStateMask = 0x006F;
-// Expected values for common states
-static constexpr uint16_t kRTSO = azd::cia402::sw::READY_TO_SWITCH_ON | azd::cia402::sw::QUICK_STOP_ACTIVE;                 // 0x0021
-static constexpr uint16_t kSON  = azd::cia402::sw::READY_TO_SWITCH_ON | azd::cia402::sw::SWITCHED_ON | azd::cia402::sw::QUICK_STOP_ACTIVE; // 0x0023
-static constexpr uint16_t kOPE  = azd::cia402::sw::READY_TO_SWITCH_ON | azd::cia402::sw::SWITCHED_ON | azd::cia402::sw::OPERATION_ENABLED | azd::cia402::sw::QUICK_STOP_ACTIVE; // 0x0027
-
-inline bool is_ready_to_switch_on(uint16_t swv) { return (swv & kStateMask) == kRTSO; }
-inline bool is_switched_on       (uint16_t swv) { return (swv & kStateMask) == kSON;  }
-inline bool is_operation_enabled (uint16_t swv) { return (swv & kStateMask) == kOPE;  }
-
-// === Wait utility (terminates early if a Fault is detected) ===
-static bool wait_state(std::function<void()> io, std::function<uint16_t()> get_sw,
-                       std::function<bool(uint16_t)> pred,
-                       double timeout_s, double cycle_s)
+// ===== CiA-402 enable sequence (robust: Fault reset multi + 0x0006→0x0007→0x000F) =====
+static bool cia402_enable_seq(azd::cia402::RxPdoPP6B* rx,
+                              const azd::cia402::TxPdoPP6B* tx)
 {
-  const int max_iter = std::max(1, int(timeout_s / cycle_s));
-  for (int i = 0; i < max_iter; ++i) {
-    io();
-    const auto swv = get_sw();
-    if (is_fault(swv)) return false;      // Abort if a Fault is detected
-    if (pred(swv))     return true;       // Target state reached
-    ros::Duration(cycle_s).sleep();
+  // Fault Reset (bit7) を多重送出
+  for (int i = 0; i < 20; ++i) {
+    rx->controlword = (1u << 7);
+    ec_send_processdata(); ec_receive_processdata(EC_TIMEOUTRET);
+    ros::Duration(0.005).sleep();
   }
-  return false;                           // Timed out waiting
-}
 
-// === Enable procedure (using cw constants from header, with Fault reset) ===
-static bool cia402_enable(uint16 /*slave*/,
-                          azd::cia402::RxPdoPP6B* rx,
-                          const azd::cia402::TxPdoPP6B* tx,
-                          double cycle_s = 0.002 /*2ms*/,
-                          double timeout_s = 1.0  /*1s per stage*/)
-{
-  using namespace azd::cia402;
-  auto io     = [](){ ec_send_processdata(); ec_receive_processdata(EC_TIMEOUTRET); };
-  auto get_sw = [tx](){ return tx->statusword; };
+  // 状態遷移：Shutdown→Switch on→Enable operation
+  int step = 0; int timeout = 5000;
+  while (timeout-- > 0) {
+    ec_send_processdata(); ec_receive_processdata(EC_TIMEOUTRET);
+    uint16_t sw = tx->statusword;
 
-  // --- If Fault is present, send Fault Reset ---
-  if (is_fault(get_sw())) {
-    static constexpr uint16_t FAULT_RESET = (1u << 7); // Controlword bit7 = Fault Reset
-    rx->controlword = FAULT_RESET;
-    if (!wait_state(io, get_sw, [](uint16_t swv){ return !is_fault(swv); }, timeout_s, cycle_s)) {
-      ROS_ERROR("Fault reset timeout");
-      return false;
+    switch (step) {
+      case 0: // Ready to switch on 待ち
+        rx->controlword = 0x0006; /* Shutdown */
+        if (sw & (1 << 0)) step = 1; // bit0: Ready to switch on
+        break;
+      case 1: // Switched on 待ち
+        rx->controlword = 0x0007; /* Switch on */
+        if ((sw & 0x006F) == 0x0023) step = 2; // 0x0023
+        break;
+      case 2: // Operation enabled 待ち
+        rx->controlword = 0x000F; /* Enable operation */
+        if ((sw & 0x006F) == 0x0027) return true; // 0x0027
+        break;
     }
+    ros::Duration(0.001).sleep();
   }
-
-  // 1) Shutdown → Ready to Switch On
-  rx->controlword = cw::SHUTDOWN;              // ENABLE_VOLTAGE | QUICK_STOP
-  if (!wait_state(io, get_sw, is_ready_to_switch_on, timeout_s, cycle_s)) {
-    ROS_ERROR("Timeout waiting Ready-to-Switch-On");
-    return false;
-  }
-
-  // 2) Switch On → Switched On
-  rx->controlword = cw::SWITCH_ON_ONLY;        // + SWITCH_ON
-  if (!wait_state(io, get_sw, is_switched_on, timeout_s, cycle_s)) {
-    ROS_ERROR("Timeout waiting Switched-On");
-    return false;
-  }
-
-  // 3) Enable Operation → Operation Enabled
-  rx->controlword = cw::ENABLE_OP;             // + ENABLE_OPERATION
-  if (!wait_state(io, get_sw, is_operation_enabled, timeout_s, cycle_s)) {
-    ROS_ERROR("Timeout waiting Operation-Enabled");
-    return false;
-  }
-
-  return true;
+  ROS_ERROR("Enable sequence failed: SW=0x%04X", tx->statusword);
+  return false;
 }
 
-// ===== Trigger new set-point in PP mode =====
-static void trigger_pp(azd::cia402::RxPdoPP6B* rx, int32_t tgt) {
-  using namespace azd::cia402;
+// ===== PP trigger: Bit4/5 pulse, always return to 0x000F base =====
+static void trigger_pp(azd::cia402::RxPdoPP6B* rx, int32_t tgt,
+                       bool immediate = true, bool relative = false)
+{
+  // ベースは運転有効 0x000F（相対時はBit6もセット）
+  uint16_t base = 0x000F;
+  if (relative) base |= (1u << 6); // Abs/Rel
+
   rx->target_position = tgt;
-  rx->controlword |= cw::NEW_SETPOINT;
-  ec_send_processdata();
-  ec_receive_processdata(EC_TIMEOUTRET);
-  rx->controlword &= ~cw::NEW_SETPOINT;
+
+  // パルスON（Bit4 New set-point，必要ならBit5 Change immediately）
+  uint16_t on = base | (1u << 4) | (immediate ? (1u << 5) : 0);
+
+  rx->controlword = on;
+  for (int i = 0; i < 15; ++i) {
+    ec_send_processdata(); ec_receive_processdata(EC_TIMEOUTRET);
+    ros::Duration(0.002).sleep();
+  }
+
+  // パルスOFF（ベースへ復帰：Bit4/5を確実に落とす）
+  // rx->controlword = base;
+  for (int i = 0; i < 5; ++i) {
+    ec_send_processdata(); ec_receive_processdata(EC_TIMEOUTRET);
+    ros::Duration(0.002).sleep();
+  }
 }
 
-// ===== Free-function callbacks to avoid subscribe() ambiguity =====
+// ===== Free-function callbacks =====
 static void on_target_abs(const std_msgs::Int32::ConstPtr& m) {
   g_cmd_target = m->data;
   g_have_cmd   = true;
 }
 static void on_move_delta(const std_msgs::Int32::ConstPtr& m) {
-  g_delta      = m->data;  // store delta only; apply in main loop using current position
+  g_delta      = m->data;
   g_have_delta = true;
 }
 
@@ -179,13 +168,13 @@ int main(int argc, char** argv)
   pnh.param("cycle_hz", cycle_hz, cycle_hz);
   if (cycle_hz < 50) cycle_hz = 50;
 
-  int32_t profile_vel = 20000, acc = 20000, dec = 20000;
+  int32_t profile_vel = 20000, acc = 50000, dec = 50000; // 少し余裕のある既定値
   pnh.param("profile_velocity", profile_vel, profile_vel);
   pnh.param("profile_acc",      acc,         acc);
   pnh.param("profile_dec",      dec,         dec);
 
   // SOEM init
-  if (!ec_init(ifname.c_str())) {
+  if (!ec_init(ifname.data())) {
     ROS_FATAL_STREAM("ec_init failed: " << ifname);
     return 1;
   }
@@ -203,22 +192,39 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  // PDO remap + mode and motion profile SDOs
-  if (!pdo_remap(slave)) {
-    ROS_WARN("PDO remap failed (continuing)");
-  }
+  // --- 重要：PO2SOconfig で Pre-Op→Safe-Op フック時にPDOリマップ ---
+  ec_slave[slave].PO2SOconfig = [](uint16 slave_id) -> int {
+    return pdo_remap(slave_id) ? 1 : 0;
+  };
+
+  // モード・プロファイルは SDO でも明示（後で上書き可）
   sdo_u8 (slave, idx::MODES_OF_OPERATION, 0x00, static_cast<int8_t>(OpMode::PP));
   sdo_u32(slave, idx::PROFILE_VELOCITY,   0x00, (uint32)profile_vel);
   sdo_u32(slave, idx::PROFILE_ACCEL,      0x00, (uint32)acc);
   sdo_u32(slave, idx::PROFILE_DECEL,      0x00, (uint32)dec);
 
-  // Configure PDO mapping & DC
-  static uint8 IOmap[128];
+  // Configure PDO mapping & (DCは一旦無効化で切り分け)
+  static uint8 IOmap[1024];
   int used = ec_config_map(&IOmap);
   ROS_INFO("IOmap size: %d bytes", used);
-  ec_configdc();
+  // ec_configdc(); // ←切り分けのため無効化（必要になったら戻す）
 
-  // SAFE_OP -> OP (set master / slave 0 state)
+  // === WKCウォームアップ：期待WKCに達するまでPD交換を回す ===
+  int expected = (ec_group[0].outputsWKC * 2) + ec_group[0].inputsWKC;
+  int wkc = 0, ok = 0;
+  for (int i = 0; i < 5000; ++i) { // ～約5秒
+    ec_send_processdata();
+    wkc = ec_receive_processdata(EC_TIMEOUTRET);
+    if (wkc == expected) { ok = 1; break; }
+    ros::Duration(0.001).sleep();
+  }
+  if (!ok) {
+    ROS_ERROR("WKC not stable: got=%d expected=%d", wkc, expected);
+    ec_close();
+    return 1;
+  }
+
+  // SAFE_OP -> OP（マスタ・スレーブ0へ要求）
   ec_slave[0].state = EC_STATE_SAFE_OP;
   ec_writestate(0);
   ec_statecheck(0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
@@ -236,18 +242,21 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  // Initialize outputs
+  // 初期化
   rx->controlword     = 0;
   rx->target_position = 0;
 
-  // Enable CiA-402
-   cia402_enable(slave, rx, tx);
+  // CiA-402有効化（堅牢版）
+  if (!cia402_enable_seq(rx, tx)) {
+    ec_close();
+    return 1;
+  }
 
   // Publishers
   ros::Publisher pub_sw  = pnh.advertise<std_msgs::UInt16>("status_word", 10);
   ros::Publisher pub_pos = pnh.advertise<std_msgs::Int32>("position_actual", 10);
 
-  // Subscribers (free functions to avoid overload ambiguity)
+  // Subscribers
   ros::Subscriber sub_abs   = pnh.subscribe("target_position", 10, on_target_abs);
   ros::Subscriber sub_delta = pnh.subscribe("move_delta",      10, on_move_delta);
 
@@ -255,19 +264,31 @@ int main(int argc, char** argv)
   uint32_t tick = 0;
 
   while (ros::ok()) {
-    // Process data exchange
+    // PD exchange
     ec_send_processdata();
     ec_receive_processdata(EC_TIMEOUTRET);
 
     // Absolute move (PP)
     if (g_have_cmd.exchange(false)) {
-      trigger_pp(rx, g_cmd_target.load());
+      int32_t tgt = g_cmd_target.load();
+
+      // 念のため607AへSDOでも書く（機種依存対策）
+      std::cout << "PASS" << std::endl;
+      sdo_u32(slave, idx::TARGET_POSITION, 0x00, static_cast<uint32_t>(tgt));
+
+      // Bit4/5をパルスし，最後は0x000Fへ確実に戻す
+      trigger_pp(rx, tgt, /*immediate=*/true, /*relative=*/false);
     }
 
-    // Relative move: current position + delta
+    // Relative move (current + delta)
     if (g_have_delta.exchange(false)) {
       int32_t tgt = tx->position_actual + g_delta.load();
-      trigger_pp(rx, tgt);
+
+      // 念のため607AへSDOでも書く
+      sdo_u32(slave, idx::TARGET_POSITION, 0x00, static_cast<uint32_t>(tgt));
+
+      // 相対移動フラグ（Bit6）を立てたベースでパルス
+      trigger_pp(rx, tgt, /*immediate=*/true, /*relative=*/true);
     }
 
     // Publish status at ~50 Hz

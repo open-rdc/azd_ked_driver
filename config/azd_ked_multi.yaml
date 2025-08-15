@@ -2,22 +2,10 @@ ifname: "enp0s31f6"
 cycle_hz: 500
 
 motors:
-  names: [joint1, joint2, joint3]
+  names: [joint1]
 
   joint1:
     slave: 1
     profile_velocity: 20000
     profile_acc: 20000
     profile_dec: 20000
-
-  joint2:
-    slave: 2
-    profile_velocity: 15000
-    profile_acc: 15000
-    profile_dec: 15000
-
-  joint3:
-    slave: 3
-    profile_velocity: 10000
-    profile_acc: 10000
-    profile_dec: 10000

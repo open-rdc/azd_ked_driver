@@ -140,3 +140,11 @@ endif()
 add_custom_command(TARGET azd_ked_pp_check POST_BUILD
   COMMAND sudo setcap cap_net_raw,cap_net_admin=eip $<TARGET_FILE:azd_ked_pp_check>
 )
+
+add_custom_command(TARGET azd_ked_node POST_BUILD
+  COMMAND sudo setcap cap_net_raw,cap_net_admin=eip $<TARGET_FILE:azd_ked_node>
+)
+
+add_custom_command(TARGET azd_ked_multi_node POST_BUILD
+  COMMAND sudo setcap cap_net_raw,cap_net_admin=eip $<TARGET_FILE:azd_ked_multi_node>
+)
